@@ -2,16 +2,9 @@ use esp_idf_hal::delay::BLOCK;
 use esp_idf_hal::gpio::PinDriver;
 use esp_idf_hal::prelude::*;
 use esp_idf_hal::uart::*;
+use esp_idf_hal::uart::config::*; // Parityを使うために必須
 use std::time::Duration;
 use std::thread;
-
-// --- 受信側の設定 ---
-// 送信側が「0x0002」宛に送っているので、自分のアドレスを「0x0002」にします
-const MY_ADDR_H: u8 = 0x00;
-const MY_ADDR_L: u8 = 0x02;
-
-// チャンネル (送信側と同じにする必要があります)
-const MY_CHAN: u8 = 0x00;
 
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
@@ -20,95 +13,97 @@ fn main() -> anyhow::Result<()> {
     let peripherals = Peripherals::take()?;
     let pins = peripherals.pins;
 
-    // 1. ピン準備
+    // --- 1. ピン設定 ---
     let mut m0 = PinDriver::output(pins.gpio19)?;
     let mut m1 = PinDriver::output(pins.gpio21)?;
 
-    // UART設定 (E220デフォルト9600bps)
-    let config = UartConfig::new().baudrate(9600.Hz());
+    // AUXピンは使いません（時間制御で管理します）
+
+    // --- 2. UART初期化 (9600bps, 8N1) ---
+    // ここでパリティを None に指定します
+    let mut config = UartConfig::new().baudrate(9600.Hz());
+    config.parity = Parity::ParityNone;
+
     let uart = UartDriver::new(
         peripherals.uart2,
-        pins.gpio17, // TX -> RX
-        pins.gpio16, // RX -> TX
+        pins.gpio17, // TX
+        pins.gpio16, // RX
         Option::<esp_idf_hal::gpio::Gpio0>::None,
         Option::<esp_idf_hal::gpio::Gpio0>::None,
         &config
     )?;
 
-    println!("--- Initializing E220 Receiver ---");
+    println!("--- LoRa E220 Driver System Start ---");
+    thread::sleep(Duration::from_millis(1000));
 
-    // ==========================================
-    // ステップ1: 設定モード (Mode 3) へ
-    // ==========================================
+    // ================================================================
+    // Phase 1: 設定モードで設定を強制上書き (Config)
+    // ================================================================
+    println!(">> 1. Enter Config Mode (M0=1, M1=1)");
     m0.set_high()?;
     m1.set_high()?;
-    println!("Switched to Config Mode");
-    thread::sleep(Duration::from_millis(100));
 
-    // ==========================================
-    // ステップ2: 自分自身の設定を書き込む
-    // ==========================================
-    // アドレス: 0x0002, 定点送信モード(0x40): ON
-    let cfg_cmd = [
-        0xC0,      // 一時保存 (電源断で消える)
-        0x00,      // 開始アドレス
-        0x09,      // 長さ
+    // モード切替安定待ち (AUX監視の代わりに500ms待つ)
+    thread::sleep(Duration::from_millis(500));
 
-        MY_ADDR_H, // Addr High (0x00)
-        MY_ADDR_L, // Addr Low  (0x02)
-        0x62,      // SPED: 8N1, 9600bps, AirRate 2.4k
-        0x40,      // OPTION: 定点送信モード有効 (ビット6=1)
-        MY_CHAN,   // CHAN: 00ch
-        0x00,      // CRYPT_H
-        0x00,      // CRYPT_L
+    // 修復コマンド (保存, 9600bps, 8N1, 透過モード)
+    // これを起動時に毎回送ることで、常に正常な状態を保ちます
+    let fix_cmd = [
+        0xC2, 0x00, 0x08, 0x00, 0x00, 0x62, 0x01, 0x00, 0x00, 0x00, 0x00
     ];
 
-    uart.write(&cfg_cmd)?;
-    println!("Configuration sent: Addr {:02X}{:02X}", MY_ADDR_H, MY_ADDR_L);
+    println!(">> 2. Sending Configuration...");
+    uart.write(&fix_cmd)?;
 
-    // 設定レスポンスの読み捨て
-    thread::sleep(Duration::from_millis(200));
-    let mut temp_buf = [0u8; 100];
-    if let Ok(len) = uart.read(&mut temp_buf, 100) {
-        // デバッグ用にレスポンスを見たい場合はコメントアウトを外す
-        // println!("Config Response: {:?}", &temp_buf[..len]);
+    // 書き込み処理待ち (念の為1秒待つ)
+    thread::sleep(Duration::from_millis(1000));
+
+    // 応答を確認（読み捨てるだけでもOK）
+    let mut buf = [0u8; 128];
+    if let Ok(size) = uart.read(&mut buf, 100) {
+        println!(">> Config Response: {:?}", &buf[..size]);
+        // [..., 98(0x62), ...] が見えたら設定完了
     }
 
-    // ==========================================
-    // ステップ3: ノーマルモード (Mode 0) へ戻る
-    // ==========================================
+    // ================================================================
+    // Phase 2: ノーマルモードへ移行 (Comm)
+    // ================================================================
+    println!(">> 3. Switch to Normal Mode (M0=0, M1=0)");
     m0.set_low()?;
     m1.set_low()?;
-    println!("Switched to Normal Mode. Waiting for data...");
-    thread::sleep(Duration::from_millis(100));
 
-    // ==========================================
-    // ステップ4: 受信ループ
-    // ==========================================
-    let mut buf = [0u8; 256];
+    // 切り替え待ち
+    thread::sleep(Duration::from_millis(500));
+
+    println!("--- Ready to Chat ---");
+    let mut counter = 0;
 
     loop {
-        // データが来るまでブロック待機 (BLOCK)
-        match uart.read(&mut buf, BLOCK) {
+        // ==========================================
+        //  受信処理
+        // ==========================================
+        let mut rx_buf = [0u8; 256];
+        match uart.read(&mut rx_buf, 10) {
             Ok(size) if size > 0 => {
-                println!("Received {} bytes", size);
-
-                // バイト列を表示
-                // println!("Raw: {:?}", &buf[..size]);
-
-                // 文字列として表示
-                if let Ok(s) = std::str::from_utf8(&buf[..size]) {
-                    println!("Message: {}", s);
+                if let Ok(s) = std::str::from_utf8(&rx_buf[..size]) {
+                    println!("Received: {}", s);
                 } else {
-                    println!("(Binary Data)");
+                    println!("Received (Hex): {:?}", &rx_buf[..size]);
                 }
             }
-            Ok(_) => {}, // サイズ0の場合は何もしない
-            Err(e) => {
-                println!("Error: {:?}", e);
-                // エラー時は少し待つ
-                thread::sleep(Duration::from_millis(100));
-            }
+            _ => {}
         }
+
+        // ==========================================
+        //  送信処理
+        // ==========================================
+        if counter % 30 == 0 {
+            let msg = format!("Rust Loop: {}\r\n", counter / 30);
+            uart.write(msg.as_bytes())?;
+            println!("Sent: {}", msg.trim());
+        }
+
+        counter += 1;
+        thread::sleep(Duration::from_millis(100));
     }
 }
